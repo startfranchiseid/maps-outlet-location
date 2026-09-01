@@ -511,8 +511,108 @@
 
     // Track unclustered markers created in cluster mode
     let unclusteredMarkers: maplibregl.Marker[] = [];
+    // Latest outlets backing the cluster source. Kept as a module-level
+    // reference (instead of a function-scoped closure) so the debounced
+    // render callback below can be defined ONCE and reused across every
+    // data refresh, instead of registering a brand new moveend/zoomend
+    // listener pair each time (which used to leak listeners + duplicate
+    // marker renders whenever filters changed with 50k+ outlets loaded).
+    let currentClusterOutlets: Outlet[] = [];
+    let clusterMoveListenersAdded = false;
+    let clusterRenderTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Renders custom logo markers for the points that are NOT part of a
+    // cluster at the current zoom/viewport. Defined once at module scope.
+    function renderUnclusteredMarkers() {
+        if (!map || !map.getSource("outlets")) return;
+
+        // Remove old unclustered markers
+        unclusteredMarkers.forEach((m) => m.remove());
+        unclusteredMarkers = [];
+
+        // Query unclustered point features currently visible
+        const features = map.querySourceFeatures("outlets", {
+            filter: ["!", ["has", "point_count"]],
+        });
+
+        // Deduplicate by id (querySourceFeatures can return duplicates)
+        const seen = new Set<string>();
+        for (const feature of features) {
+            const props = feature.properties;
+            if (!props || seen.has(props.id)) continue;
+            seen.add(props.id);
+
+            const coords = (feature.geometry as GeoJSON.Point)
+                .coordinates as [number, number];
+            const brand = $brands.find((b) => b.id === props.brand);
+            const brandName = brand?.name || "Unknown";
+
+            let logoUrl = brandLogoCache.get(props.brand);
+            if (logoUrl === undefined && brand) {
+                logoUrl = getLogoUrl("brands", brand.id, brand.logo);
+                brandLogoCache.set(props.brand, logoUrl);
+            }
+
+            const el = document.createElement("div");
+            el.className = "custom-marker-wrapper";
+            el.style.cursor = "pointer";
+
+            if (logoUrl) {
+                el.innerHTML = `
+                    <div style="width:36px;height:36px;background:white;border-radius:50%;border:2px solid white;box-shadow:0 3px 10px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:transform 0.2s;">
+                        <img src="${logoUrl}" alt="${brandName}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" />
+                    </div>
+                `;
+            } else {
+                el.innerHTML = `<div class="custom-marker" style="background:#8b5cf6;"><i class="fas fa-store"></i></div>`;
+            }
+
+            el.addEventListener("mouseenter", () => {
+                const inner = el.firstElementChild as HTMLElement;
+                if (inner) inner.style.transform = "scale(1.25)";
+            });
+            el.addEventListener("mouseleave", () => {
+                const inner = el.firstElementChild as HTMLElement;
+                if (inner) inner.style.transform = "scale(1)";
+            });
+
+            el.addEventListener("click", (evt) => {
+                evt.stopPropagation();
+                const outlet = currentClusterOutlets.find(
+                    (o) => o.id === props.id,
+                );
+                if (outlet) {
+                    selectedOutlet.set(outlet);
+                    const sidebar = document.getElementById("sidebar");
+                    if (sidebar && sidebar.classList.contains("hidden")) {
+                        sidebar.classList.remove("hidden");
+                    }
+                    map.flyTo({
+                        center: coords,
+                        zoom: 16,
+                        padding: { left: 400 },
+                    });
+                }
+            });
+
+            const marker = new maplibregl.Marker({ element: el })
+                .setLngLat(coords)
+                .addTo(map);
+
+            unclusteredMarkers.push(marker);
+        }
+    }
+
+    // Debounced wrapper so rapid moveend/zoomend bursts don't re-render
+    // unclustered markers on every single frame.
+    function debouncedClusterRender() {
+        if (clusterRenderTimer) clearTimeout(clusterRenderTimer);
+        clusterRenderTimer = setTimeout(renderUnclusteredMarkers, 100);
+    }
 
     function updateMarkersWithClustering(outlets: Outlet[]) {
+        currentClusterOutlets = outlets;
+
         // Create GeoJSON FeatureCollection
         const geojson: GeoJSON.FeatureCollection = {
             type: "FeatureCollection",
@@ -635,96 +735,13 @@
             clusterHandlersAdded = true;
         }
 
-        // Use 'render' event to show brand logo markers for unclustered points
-        const renderUnclusteredMarkers = () => {
-            if (!map.getSource("outlets")) return;
+        if (!clusterMoveListenersAdded) {
+            map.on("moveend", debouncedClusterRender);
+            map.on("zoomend", debouncedClusterRender);
+            clusterMoveListenersAdded = true;
+        }
 
-            // Remove old unclustered markers
-            unclusteredMarkers.forEach((m) => m.remove());
-            unclusteredMarkers = [];
-
-            // Query unclustered point features currently visible
-            const features = map.querySourceFeatures("outlets", {
-                filter: ["!", ["has", "point_count"]],
-            });
-
-            // Deduplicate by id (querySourceFeatures can return duplicates)
-            const seen = new Set<string>();
-            for (const feature of features) {
-                const props = feature.properties;
-                if (!props || seen.has(props.id)) continue;
-                seen.add(props.id);
-
-                const coords = (feature.geometry as GeoJSON.Point)
-                    .coordinates as [number, number];
-                const brand = $brands.find((b) => b.id === props.brand);
-                const brandName = brand?.name || "Unknown";
-
-                let logoUrl = brandLogoCache.get(props.brand);
-                if (logoUrl === undefined && brand) {
-                    logoUrl = getLogoUrl("brands", brand.id, brand.logo);
-                    brandLogoCache.set(props.brand, logoUrl);
-                }
-
-                const el = document.createElement("div");
-                el.className = "custom-marker-wrapper";
-                el.style.cursor = "pointer";
-
-                if (logoUrl) {
-                    el.innerHTML = `
-                        <div style="width:36px;height:36px;background:white;border-radius:50%;border:2px solid white;box-shadow:0 3px 10px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:transform 0.2s;">
-                            <img src="${logoUrl}" alt="${brandName}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" />
-                        </div>
-                    `;
-                } else {
-                    el.innerHTML = `<div class="custom-marker" style="background:#8b5cf6;"><i class="fas fa-store"></i></div>`;
-                }
-
-                el.addEventListener("mouseenter", () => {
-                    const inner = el.firstElementChild as HTMLElement;
-                    if (inner) inner.style.transform = "scale(1.25)";
-                });
-                el.addEventListener("mouseleave", () => {
-                    const inner = el.firstElementChild as HTMLElement;
-                    if (inner) inner.style.transform = "scale(1)";
-                });
-
-                el.addEventListener("click", (evt) => {
-                    evt.stopPropagation();
-                    const outlet = outlets.find((o) => o.id === props.id);
-                    if (outlet) {
-                        selectedOutlet.set(outlet);
-                        const sidebar = document.getElementById("sidebar");
-                        if (sidebar && sidebar.classList.contains("hidden")) {
-                            sidebar.classList.remove("hidden");
-                        }
-                        map.flyTo({
-                            center: coords,
-                            zoom: 16,
-                            padding: { left: 400 },
-                        });
-                    }
-                });
-
-                const marker = new maplibregl.Marker({ element: el })
-                    .setLngLat(coords)
-                    .addTo(map);
-
-                unclusteredMarkers.push(marker);
-            }
-        };
-
-        // Remove previous listener if any
-        map.off("render", renderUnclusteredMarkers);
-        // Debounced render to avoid too many updates
-        let renderTimer: ReturnType<typeof setTimeout> | null = null;
-        const debouncedRender = () => {
-            if (renderTimer) clearTimeout(renderTimer);
-            renderTimer = setTimeout(renderUnclusteredMarkers, 100);
-        };
-        map.on("moveend", debouncedRender);
-        map.on("zoomend", debouncedRender);
-        // Also run once immediately
+        // Render immediately for the current viewport with fresh data
         renderUnclusteredMarkers();
     }
 
@@ -736,6 +753,13 @@
             });
             if (map.getSource("outlets")) map.removeSource("outlets");
             clusterSourceAdded = false;
+        }
+        // No longer in cluster mode: stop the moveend/zoomend listeners so
+        // they don't keep polling a source that no longer exists.
+        if (clusterMoveListenersAdded) {
+            map.off("moveend", debouncedClusterRender);
+            map.off("zoomend", debouncedClusterRender);
+            clusterMoveListenersAdded = false;
         }
         // Clear unclustered markers
         unclusteredMarkers.forEach((m) => m.remove());
